@@ -1,0 +1,98 @@
+#!/usr/bin/python3 -I
+# CUPS filter: PDF -> Datamax DPL.
+# Each page is rasterised to 1-bit, downloaded to printer DRAM as a BMP,
+# placed at the label origin, printed, then deleted.
+# Usage (CUPS): pdftodpl job user title copies options [file]
+import os, struct, subprocess, sys, tempfile
+
+DPI = 300
+MAX_LABEL_LENGTH = 650  # hundredths of an inch; the printer keeps resetting to 5in
+IMAGE = "CUPSLBL"
+STX = b"\x02"
+
+
+def log(msg):
+    sys.stderr.write(f"INFO: pdftodpl: {msg}\n")
+    sys.stderr.flush()
+
+
+def read_pbm(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    # P4 header: magic, width, height, separated by whitespace (and maybe comments)
+    fields, i = [], 0
+    while len(fields) < 3:
+        while data[i:i + 1].isspace():
+            i += 1
+        if data[i:i + 1] == b"#":
+            while data[i:i + 1] not in (b"\n", b""):
+                i += 1
+            continue
+        j = i
+        while not data[j:j + 1].isspace():
+            j += 1
+        fields.append(data[i:j])
+        i = j
+    assert fields[0] == b"P4", "expected binary PBM"
+    width, height = int(fields[1]), int(fields[2])
+    i += 1  # single whitespace after header
+    return width, height, data[i:]
+
+
+def pbm_to_bmp(width, height, bits):
+    # PBM: 1 = black, rows top-down, padded to a byte.
+    # BMP: rows bottom-up, padded to 4 bytes. The printer ignores the palette and
+    # prints 0 bits as black, so invert, and keep the palette (0 = black) truthful.
+    src_stride = (width + 7) // 8
+    dst_stride = (src_stride + 3) & ~3
+    pad = b"\xff" * (dst_stride - src_stride)
+    inverted = bytes(b ^ 0xFF for b in bits)
+    rows = [inverted[y * src_stride:(y + 1) * src_stride] + pad for y in range(height)]
+    pixels = b"".join(reversed(rows))
+    palette = b"\x00\x00\x00\x00" + b"\xff\xff\xff\x00"
+    offset = 14 + 40 + len(palette)
+    file_header = struct.pack("<2sIHHI", b"BM", offset + len(pixels), 0, 0, offset)
+    ppm = round(DPI / 0.0254)
+    info_header = struct.pack("<IiiHHIIiiII", 40, width, height, 1, 1, 0,
+                              len(pixels), ppm, ppm, 2, 2)
+    return file_header + info_header + palette + pixels
+
+
+def page_to_dpl(pbm_path, copies):
+    width, height, bits = read_pbm(pbm_path)
+    log(f"page {os.path.basename(pbm_path)} {width}x{height}")
+    out = bytearray()
+    out += STX + f"IDB{IMAGE}\r".encode() + pbm_to_bmp(width, height, bits)
+    out += STX + b"L\r"
+    out += b"D11\r"
+    out += f"1Y1100000000000{IMAGE}\r".encode()
+    out += f"Q{copies:04d}\r".encode()
+    out += b"E\r"
+    out += STX + f"xDG{IMAGE}\r".encode()
+    return bytes(out)
+
+
+def main():
+    if len(sys.argv) not in (6, 7):
+        sys.stderr.write("usage: pdftodpl job user title copies options [file]\n")
+        return 1
+    copies = max(1, int(sys.argv[4] or 1))
+    with tempfile.TemporaryDirectory() as tmp:
+        pdf = sys.argv[6] if len(sys.argv) == 7 else os.path.join(tmp, "in.pdf")
+        if len(sys.argv) == 6:
+            with open(pdf, "wb") as f:
+                f.write(sys.stdin.buffer.read())
+        subprocess.run(["pdftoppm", "-r", str(DPI), "-mono", pdf, os.path.join(tmp, "p")], check=True)
+        pages = sorted(p for p in os.listdir(tmp) if p.endswith(".pbm"))
+        out = sys.stdout.buffer
+        # <STX>M is read in the printer's units, which this one has set to metric:
+        # force inches (<STX>n) first so the length means hundredths of an inch.
+        out.write(STX + b"n\r" + STX + f"M{MAX_LABEL_LENGTH:04d}\r".encode())
+        for p in pages:
+            out.write(page_to_dpl(os.path.join(tmp, p), copies))
+        out.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
